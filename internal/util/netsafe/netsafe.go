@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -68,6 +69,81 @@ var defaultDialer = &net.Dialer{Timeout: 10 * time.Second}
 // minDialAttempt is net.Dialer's floor for one address of a name.
 const minDialAttempt = 2 * time.Second
 
+// minDuration returns the smaller of two durations
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// maxDuration returns the larger of two durations
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// DNS cache to avoid repeated lookups for the same host
+var (
+	dnsCacheMu  sync.RWMutex
+	dnsCache    = make(map[string]cachedDNSEntry)
+	dnsCacheTTL = 5 * time.Minute
+)
+
+type cachedDNSEntry struct {
+	ips       []net.IPAddr
+	expiresAt time.Time
+}
+
+// Custom DNS resolver with fallback servers
+var customDNSResolver = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		d := net.Dialer{Timeout: 5 * time.Second}
+		// Try multiple DNS servers
+		for _, server := range []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"} {
+			conn, err := d.DialContext(ctx, "udp", server)
+			if err == nil {
+				return conn, nil
+			}
+		}
+		return d.DialContext(ctx, network, address)
+	},
+}
+
+// lookupIPCached performs DNS lookup with caching and fallback resolvers
+func lookupIPCached(ctx context.Context, host string) ([]net.IPAddr, error) {
+	// Check cache first
+	dnsCacheMu.RLock()
+	if entry, ok := dnsCache[host]; ok && time.Now().Before(entry.expiresAt) {
+		dnsCacheMu.RUnlock()
+		return entry.ips, nil
+	}
+	dnsCacheMu.RUnlock()
+
+	// Try custom resolver with fallback DNS servers first
+	ips, err := customDNSResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		// Fallback to default resolver
+		ips, err = net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Cache the result
+	dnsCacheMu.Lock()
+	dnsCache[host] = cachedDNSEntry{
+		ips:       ips,
+		expiresAt: time.Now().Add(dnsCacheTTL),
+	}
+	dnsCacheMu.Unlock()
+
+	return ips, nil
+}
+
 func SSRFGuardedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -82,7 +158,7 @@ func SSRFGuardedDialContext(ctx context.Context, network, addr string) (net.Conn
 	if ip := net.ParseIP(host); ip != nil {
 		ips = []net.IPAddr{{IP: ip}}
 	} else {
-		ips, err = net.DefaultResolver.LookupIPAddr(ctx, host)
+		ips, err = lookupIPCached(ctx, host)
 		if err != nil {
 			return nil, err
 		}
@@ -98,7 +174,7 @@ func SSRFGuardedDialContext(ctx context.Context, network, addr string) (net.Conn
 		if remaining <= 0 {
 			break
 		}
-		attempt := max(remaining/time.Duration(len(ips)-i), min(minDialAttempt, remaining))
+		attempt := maxDuration(remaining/time.Duration(len(ips)-i), minDuration(minDialAttempt, remaining))
 		attemptCtx, attemptCancel := context.WithTimeout(ctx, attempt)
 		conn, derr := defaultDialer.DialContext(attemptCtx, network, net.JoinHostPort(ipAddr.IP.String(), port))
 		attemptCancel()

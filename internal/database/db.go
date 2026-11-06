@@ -10,6 +10,8 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -3481,8 +3483,23 @@ func migrateApiTokenScopeAndExpiry() error {
 // restart loop. Every failed attempt logs the real driver error, which
 // used to be buried behind a generic startup failure.
 func openPostgresWithRetry(dsn string, c *gorm.Config) (*gorm.DB, error) {
-	delays := []time.Duration{0, 2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second}
+	// Parse host and port from DSN for TCP connectivity check
+	host, port := parsePostgresHostPort(dsn)
+
+	// Increased delays for slower PostgreSQL startup (total ~120s)
+	delays := []time.Duration{0, 2 * time.Second, 5 * time.Second, 10 * time.Second, 15 * time.Second, 20 * time.Second, 30 * time.Second, 30 * time.Second}
 	var lastErr error
+
+	// First, wait for TCP port to be reachable
+	if host != "" && port > 0 {
+		log.Printf("Waiting for PostgreSQL TCP port %s:%d to become reachable...", host, port)
+		if err := waitForTCPPort(host, port, 60*time.Second); err != nil {
+			log.Printf("TCP port check failed: %v, will still attempt GORM connection", err)
+		} else {
+			log.Printf("PostgreSQL TCP port %s:%d is reachable", host, port)
+		}
+	}
+
 	for i, delay := range delays {
 		if delay > 0 {
 			time.Sleep(delay)
@@ -3498,6 +3515,57 @@ func openPostgresWithRetry(dsn string, c *gorm.Config) (*gorm.DB, error) {
 		log.Printf("postgres connection attempt %d/%d failed: %v", i+1, len(delays), err)
 	}
 	return nil, fmt.Errorf("postgres unreachable after %d attempts: %w", len(delays), lastErr)
+}
+
+// parsePostgresHostPort extracts host and port from a PostgreSQL DSN
+func parsePostgresHostPort(dsn string) (string, int) {
+	// DSN format: postgres://user:pass@host:port/dbname?params
+	// or: host=host port=port user=user password=pass dbname=dbname
+	// We'll try to parse the URL format first
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err == nil && u.Host != "" {
+			host := u.Hostname()
+			port := 5432
+			if u.Port() != "" {
+				if p, err := strconv.Atoi(u.Port()); err == nil {
+					port = p
+				}
+			}
+			return host, port
+		}
+	}
+	// Try key=value format
+	for _, part := range strings.Split(dsn, " ") {
+		if strings.HasPrefix(part, "host=") {
+			host := strings.TrimPrefix(part, "host=")
+			return host, 5432
+		}
+		if strings.HasPrefix(part, "port=") {
+			if p, err := strconv.Atoi(strings.TrimPrefix(part, "port=")); err == nil {
+				return "", p
+			}
+		}
+	}
+	return "", 5432
+}
+
+// waitForTCPPort waits for a TCP port to become reachable
+func waitForTCPPort(host string, port int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		dialer := &net.Dialer{}
+		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for TCP port %s:%d after %v", host, port, timeout)
 }
 
 // The store holds client secrets, so it and its WAL/SHM side files stay
